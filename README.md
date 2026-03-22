@@ -30,6 +30,12 @@ Upload:
 
 Pick 3-8 anchors across camera motion changes (example frames below):
 
+In Colab, run this in a Python cell before annotation so clicks are interactive:
+
+```python
+%matplotlib widget
+```
+
 ```bash
 !python3 run_pipeline.py annotate \
   --video stal2.mp4 \
