@@ -30,7 +30,7 @@ Upload files to Colab (or mount Drive):
 Run:
 
 ```bash
-!python run_pipeline.py \
+!python3 run_pipeline.py \
   --video stal2.mp4 \
   --mot mot.txt \
   --output_dir outputs
@@ -47,10 +47,10 @@ Outputs:
 ## Local Run
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python run_pipeline.py --video stal2.mp4 --mot mot.txt --output_dir outputs
+python3 run_pipeline.py --video stal2.mp4 --mot mot.txt --output_dir outputs
 ```
 
 ---
@@ -63,7 +63,7 @@ python run_pipeline.py --video stal2.mp4 --mot mot.txt --output_dir outputs
 - If you already have a local model file:
 
 ```bash
-python run_pipeline.py \
+python3 run_pipeline.py \
   --video stal2.mp4 \
   --mot mot.txt \
   --model_path /path/to/best.pt \
