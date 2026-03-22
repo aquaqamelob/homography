@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-End-to-end football pitch homography pipeline.
+Human-in-the-loop football pitch homography pipeline.
 
-Inputs:
-  - Video file (broadcast/drone style football footage)
-  - MOT txt file with rows:
-      frame, id, x, y, width, height, confidence, class, visibility, unused
+This script intentionally avoids YOLO keypoint detection and relies on:
+1) Sparse manual keyframe calibration (human picks known field landmarks)
+2) Automatic inter-frame homography propagation with ECC
+3) Drift checks from line-mask agreement
+4) MOT-assisted dynamic masking
 
-Outputs:
-  - AR overlay video (pitch lines projected back to camera view + radar inset)
-  - homographies.jsonl
-  - player_positions.csv (player feet in image + top-down meters)
+Usage:
+  # Step 1: create anchors manually
+  python3 run_pipeline.py annotate --video stal2.mp4 --frames 1,250,500 --anchors anchors.json
+
+  # Step 2: run pipeline with MOT + anchors
+  python3 run_pipeline.py run --video stal2.mp4 --mot mot.txt --anchors anchors.json --output_dir outputs
 """
 
 from __future__ import annotations
@@ -18,17 +21,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from huggingface_hub import hf_hub_download
 from tqdm import tqdm
-from ultralytics import YOLO
 
 
 # FIFA-like standard dimensions (meters)
@@ -57,47 +58,35 @@ def _goal_bottom_y() -> float:
     return (PITCH_WIDTH_M + GOAL_AREA_WIDTH_M) / 2.0
 
 
-def _left_arc_rightmost_x() -> float:
-    # Penalty spot at x=11m, arc radius=9.15m
-    return 11.0 + CENTER_CIRCLE_RADIUS_M
-
-
-def _right_arc_leftmost_x() -> float:
-    return PITCH_LENGTH_M - _left_arc_rightmost_x()
-
-
-# Must match model's keypoint index definitions.
-# Coordinates are in meters in a canonical top-down field coordinate system.
-KEYPOINT_TO_WORLD_M: Dict[int, Tuple[float, float]] = {
-    0: (0.0, 0.0),  # sideline_top_left
-    1: (0.0, _penalty_top_y()),  # big_rect_left_top_pt1
-    2: (PENALTY_AREA_DEPTH_M, _penalty_top_y()),  # big_rect_left_top_pt2
-    3: (0.0, _penalty_bottom_y()),  # big_rect_left_bottom_pt1
-    4: (PENALTY_AREA_DEPTH_M, _penalty_bottom_y()),  # big_rect_left_bottom_pt2
-    5: (0.0, _goal_top_y()),  # small_rect_left_top_pt1
-    6: (GOAL_AREA_DEPTH_M, _goal_top_y()),  # small_rect_left_top_pt2
-    7: (0.0, _goal_bottom_y()),  # small_rect_left_bottom_pt1
-    8: (GOAL_AREA_DEPTH_M, _goal_bottom_y()),  # small_rect_left_bottom_pt2
-    9: (0.0, PITCH_WIDTH_M),  # sideline_bottom_left
-    10: (_left_arc_rightmost_x(), PITCH_WIDTH_M / 2.0),  # left_semicircle_right
-    11: (PITCH_LENGTH_M / 2.0, 0.0),  # center_line_top
-    12: (PITCH_LENGTH_M / 2.0, PITCH_WIDTH_M),  # center_line_bottom
-    13: (PITCH_LENGTH_M / 2.0, (PITCH_WIDTH_M / 2.0) - CENTER_CIRCLE_RADIUS_M),  # center_circle_top
-    14: (PITCH_LENGTH_M / 2.0, (PITCH_WIDTH_M / 2.0) + CENTER_CIRCLE_RADIUS_M),  # center_circle_bottom
-    15: (PITCH_LENGTH_M / 2.0, PITCH_WIDTH_M / 2.0),  # field_center
-    16: (PITCH_LENGTH_M, 0.0),  # sideline_top_right
-    17: (PITCH_LENGTH_M - PENALTY_AREA_DEPTH_M, _penalty_top_y()),  # big_rect_right_top_pt1
-    18: (PITCH_LENGTH_M, _penalty_top_y()),  # big_rect_right_top_pt2
-    19: (PITCH_LENGTH_M - PENALTY_AREA_DEPTH_M, _penalty_bottom_y()),  # big_rect_right_bottom_pt1
-    20: (PITCH_LENGTH_M, _penalty_bottom_y()),  # big_rect_right_bottom_pt2
-    21: (PITCH_LENGTH_M - GOAL_AREA_DEPTH_M, _goal_top_y()),  # small_rect_right_top_pt1
-    22: (PITCH_LENGTH_M, _goal_top_y()),  # small_rect_right_top_pt2
-    23: (PITCH_LENGTH_M - GOAL_AREA_DEPTH_M, _goal_bottom_y()),  # small_rect_right_bottom_pt1
-    24: (PITCH_LENGTH_M, _goal_bottom_y()),  # small_rect_right_bottom_pt2
-    25: (PITCH_LENGTH_M, PITCH_WIDTH_M),  # sideline_bottom_right
-    26: (_right_arc_leftmost_x(), PITCH_WIDTH_M / 2.0),  # right_semicircle_left
-    27: ((PITCH_LENGTH_M / 2.0) - CENTER_CIRCLE_RADIUS_M, PITCH_WIDTH_M / 2.0),  # center_circle_left
-    28: ((PITCH_LENGTH_M / 2.0) + CENTER_CIRCLE_RADIUS_M, PITCH_WIDTH_M / 2.0),  # center_circle_right
+LANDMARKS_M: Dict[str, Tuple[float, float]] = {
+    # Outer corners / boundaries
+    "corner_top_left": (0.0, 0.0),
+    "corner_top_right": (PITCH_LENGTH_M, 0.0),
+    "corner_bottom_left": (0.0, PITCH_WIDTH_M),
+    "corner_bottom_right": (PITCH_LENGTH_M, PITCH_WIDTH_M),
+    "halfway_top": (PITCH_LENGTH_M / 2.0, 0.0),
+    "halfway_bottom": (PITCH_LENGTH_M / 2.0, PITCH_WIDTH_M),
+    # Left penalty area
+    "left_penalty_top_outer": (0.0, _penalty_top_y()),
+    "left_penalty_top_inner": (PENALTY_AREA_DEPTH_M, _penalty_top_y()),
+    "left_penalty_bottom_outer": (0.0, _penalty_bottom_y()),
+    "left_penalty_bottom_inner": (PENALTY_AREA_DEPTH_M, _penalty_bottom_y()),
+    # Right penalty area
+    "right_penalty_top_inner": (PITCH_LENGTH_M - PENALTY_AREA_DEPTH_M, _penalty_top_y()),
+    "right_penalty_top_outer": (PITCH_LENGTH_M, _penalty_top_y()),
+    "right_penalty_bottom_inner": (PITCH_LENGTH_M - PENALTY_AREA_DEPTH_M, _penalty_bottom_y()),
+    "right_penalty_bottom_outer": (PITCH_LENGTH_M, _penalty_bottom_y()),
+    # Goal areas
+    "left_goal_top_inner": (GOAL_AREA_DEPTH_M, _goal_top_y()),
+    "left_goal_bottom_inner": (GOAL_AREA_DEPTH_M, _goal_bottom_y()),
+    "right_goal_top_inner": (PITCH_LENGTH_M - GOAL_AREA_DEPTH_M, _goal_top_y()),
+    "right_goal_bottom_inner": (PITCH_LENGTH_M - GOAL_AREA_DEPTH_M, _goal_bottom_y()),
+    # Center
+    "center_spot": (PITCH_LENGTH_M / 2.0, PITCH_WIDTH_M / 2.0),
+    "center_circle_top": (PITCH_LENGTH_M / 2.0, (PITCH_WIDTH_M / 2.0) - CENTER_CIRCLE_RADIUS_M),
+    "center_circle_bottom": (PITCH_LENGTH_M / 2.0, (PITCH_WIDTH_M / 2.0) + CENTER_CIRCLE_RADIUS_M),
+    "center_circle_left": ((PITCH_LENGTH_M / 2.0) - CENTER_CIRCLE_RADIUS_M, PITCH_WIDTH_M / 2.0),
+    "center_circle_right": ((PITCH_LENGTH_M / 2.0) + CENTER_CIRCLE_RADIUS_M, PITCH_WIDTH_M / 2.0),
 }
 
 
@@ -163,11 +152,6 @@ def parse_mot(mot_path: Path, min_conf: float = 0.0) -> Dict[int, List[MotRow]]:
     return mot_by_frame
 
 
-def download_default_model(model_repo: str, model_filename: str) -> Path:
-    model_file = hf_hub_download(repo_id=model_repo, filename=model_filename)
-    return Path(model_file)
-
-
 def build_player_mask(shape: Tuple[int, int], players: Iterable[MotRow], dilation_px: int) -> np.ndarray:
     h, w = shape
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -185,21 +169,14 @@ def build_player_mask(shape: Tuple[int, int], players: Iterable[MotRow], dilatio
 
 
 def apply_player_suppression(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    # Replace dynamic regions with local green-ish median to reduce keypoint false positives.
     suppressed = frame.copy()
-    if not np.any(mask):
-        return suppressed
-    blur = cv2.medianBlur(frame, 11)
-    suppressed[mask > 0] = blur[mask > 0]
+    if np.any(mask):
+        blur = cv2.medianBlur(frame, 11)
+        suppressed[mask > 0] = blur[mask > 0]
     return suppressed
 
 
-def meter_to_canvas(
-    x_m: float,
-    y_m: float,
-    px_per_m: float,
-    margin_px: int,
-) -> Tuple[float, float]:
+def meter_to_canvas(x_m: float, y_m: float, px_per_m: float, margin_px: int) -> Tuple[float, float]:
     return (x_m * px_per_m + margin_px, y_m * px_per_m + margin_px)
 
 
@@ -217,23 +194,25 @@ def make_field_layers(px_per_m: float, margin_px: int) -> Tuple[np.ndarray, np.n
     line_color = (255, 255, 255)
     line_thickness = max(1, int(round(px_per_m * 0.15)))
 
-    # Outer boundary
     cv2.rectangle(line_layer, pt(0, 0), pt(PITCH_LENGTH_M, PITCH_WIDTH_M), line_color, line_thickness)
-
-    # Halfway line
     cv2.line(line_layer, pt(PITCH_LENGTH_M / 2, 0), pt(PITCH_LENGTH_M / 2, PITCH_WIDTH_M), line_color, line_thickness)
 
-    # Center circle + spot
     center = pt(PITCH_LENGTH_M / 2, PITCH_WIDTH_M / 2)
     center_r = int(round(CENTER_CIRCLE_RADIUS_M * px_per_m))
     cv2.circle(line_layer, center, center_r, line_color, line_thickness)
     cv2.circle(line_layer, center, max(1, int(round(px_per_m * 0.2))), line_color, thickness=-1)
 
-    # Left penalty + goal boxes
     cv2.rectangle(
         line_layer,
         pt(0, _penalty_top_y()),
         pt(PENALTY_AREA_DEPTH_M, _penalty_bottom_y()),
+        line_color,
+        line_thickness,
+    )
+    cv2.rectangle(
+        line_layer,
+        pt(PITCH_LENGTH_M - PENALTY_AREA_DEPTH_M, _penalty_top_y()),
+        pt(PITCH_LENGTH_M, _penalty_bottom_y()),
         line_color,
         line_thickness,
     )
@@ -244,16 +223,6 @@ def make_field_layers(px_per_m: float, margin_px: int) -> Tuple[np.ndarray, np.n
         line_color,
         line_thickness,
     )
-    cv2.circle(line_layer, pt(11.0, PITCH_WIDTH_M / 2), max(1, int(round(px_per_m * 0.2))), line_color, thickness=-1)
-
-    # Right penalty + goal boxes
-    cv2.rectangle(
-        line_layer,
-        pt(PITCH_LENGTH_M - PENALTY_AREA_DEPTH_M, _penalty_top_y()),
-        pt(PITCH_LENGTH_M, _penalty_bottom_y()),
-        line_color,
-        line_thickness,
-    )
     cv2.rectangle(
         line_layer,
         pt(PITCH_LENGTH_M - GOAL_AREA_DEPTH_M, _goal_top_y()),
@@ -261,8 +230,14 @@ def make_field_layers(px_per_m: float, margin_px: int) -> Tuple[np.ndarray, np.n
         line_color,
         line_thickness,
     )
-    cv2.circle(line_layer, pt(PITCH_LENGTH_M - 11.0, PITCH_WIDTH_M / 2), max(1, int(round(px_per_m * 0.2))), line_color, thickness=-1)
-
+    cv2.circle(line_layer, pt(11.0, PITCH_WIDTH_M / 2), max(1, int(round(px_per_m * 0.2))), line_color, thickness=-1)
+    cv2.circle(
+        line_layer,
+        pt(PITCH_LENGTH_M - 11.0, PITCH_WIDTH_M / 2),
+        max(1, int(round(px_per_m * 0.2))),
+        line_color,
+        thickness=-1,
+    )
     radar_bg = cv2.addWeighted(radar_bg, 1.0, line_layer, 1.0, 0.0)
     return radar_bg, line_layer
 
@@ -272,24 +247,101 @@ def project_points(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return pts_h.reshape(-1, 2)
 
 
-def homography_jump_px(H_prev: np.ndarray, H_new: np.ndarray, image_w: int, image_h: int) -> float:
-    probe = np.array(
-        [
-            [0.0, 0.0],
-            [image_w * 0.5, 0.0],
-            [image_w - 1.0, 0.0],
-            [0.0, image_h * 0.5],
-            [image_w * 0.5, image_h * 0.5],
-            [image_w - 1.0, image_h * 0.5],
-            [0.0, image_h - 1.0],
-            [image_w * 0.5, image_h - 1.0],
-            [image_w - 1.0, image_h - 1.0],
-        ],
-        dtype=np.float32,
-    )
-    p_prev = project_points(H_prev, probe)
-    p_new = project_points(H_new, probe)
-    return float(np.mean(np.linalg.norm(p_prev - p_new, axis=1)))
+def id_to_color(track_id: int) -> Tuple[int, int, int]:
+    rng = np.random.default_rng(seed=track_id * 73 + 19)
+    return tuple(int(c) for c in rng.integers(80, 255, size=3))
+
+
+def parse_frames_arg(frames_text: str) -> List[int]:
+    parts = [p.strip() for p in frames_text.split(",") if p.strip()]
+    out: List[int] = []
+    for p in parts:
+        out.append(int(p))
+    out = sorted(set(out))
+    return out
+
+
+def build_homography_from_points(
+    image_points: Sequence[Sequence[float]],
+    world_points_m: Sequence[Sequence[float]],
+    px_per_m: float,
+    margin_px: int,
+) -> Optional[np.ndarray]:
+    if len(image_points) < 4 or len(world_points_m) < 4:
+        return None
+    src = np.asarray(image_points, dtype=np.float32)
+    dst = np.asarray([meter_to_canvas(p[0], p[1], px_per_m, margin_px) for p in world_points_m], dtype=np.float32)
+    H, _ = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+    if H is None:
+        return None
+    return H / H[2, 2]
+
+
+def load_anchor_homographies(anchors_path: Path, px_per_m: float, margin_px: int) -> Dict[int, np.ndarray]:
+    payload = json.loads(anchors_path.read_text(encoding="utf-8"))
+    anchors = payload.get("anchors", [])
+    out: Dict[int, np.ndarray] = {}
+    for item in anchors:
+        frame_idx = int(item["frame"])
+        points = item.get("points", [])
+        image_pts = []
+        world_pts = []
+        for p in points:
+            image = p.get("image")
+            if image is None or len(image) != 2:
+                continue
+            if "world_m" in p and p["world_m"] is not None:
+                world = p["world_m"]
+            else:
+                name = p.get("name")
+                world = LANDMARKS_M.get(name)
+            if world is None:
+                continue
+            image_pts.append([float(image[0]), float(image[1])])
+            world_pts.append([float(world[0]), float(world[1])])
+        H = build_homography_from_points(image_pts, world_pts, px_per_m=px_per_m, margin_px=margin_px)
+        if H is not None:
+            out[frame_idx] = H
+    return out
+
+
+def compute_line_mask(frame_bgr: np.ndarray, static_mask: Optional[np.ndarray]) -> np.ndarray:
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, (0, 0, 150), (179, 75, 255))
+    # Remove large green regions, keep white markings.
+    green = cv2.inRange(hsv, (25, 35, 30), (95, 255, 255))
+    line_mask = cv2.bitwise_and(white, cv2.bitwise_not(green))
+
+    if static_mask is not None:
+        line_mask = cv2.bitwise_and(line_mask, static_mask)
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_DILATE, kernel, iterations=1)
+    return line_mask
+
+
+def estimate_prev_to_curr_warp(
+    prev_gray: np.ndarray,
+    curr_gray: np.ndarray,
+    static_mask_curr: Optional[np.ndarray],
+    ecc_iters: int,
+) -> Tuple[Optional[np.ndarray], float]:
+    warp = np.eye(3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, ecc_iters, 1e-6)
+    try:
+        cc, warp = cv2.findTransformECC(
+            templateImage=prev_gray,
+            inputImage=curr_gray,
+            warpMatrix=warp,
+            motionType=cv2.MOTION_HOMOGRAPHY,
+            criteria=criteria,
+            inputMask=static_mask_curr,
+            gaussFiltSize=5,
+        )
+        return warp.astype(np.float64), float(cc)
+    except cv2.error:
+        return None, -1.0
 
 
 def smooth_homography(H_prev: Optional[np.ndarray], H_new: np.ndarray, alpha: float) -> np.ndarray:
@@ -301,90 +353,10 @@ def smooth_homography(H_prev: Optional[np.ndarray], H_new: np.ndarray, alpha: fl
     return H / H[2, 2]
 
 
-def id_to_color(track_id: int) -> Tuple[int, int, int]:
-    rng = np.random.default_rng(seed=track_id * 73 + 19)
-    return tuple(int(c) for c in rng.integers(80, 255, size=3))
-
-
-def extract_best_keypoints(
-    model: YOLO,
-    frame: np.ndarray,
-    frame_masked: np.ndarray,
-    kp_conf: float,
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Returns:
-      (xy, conf) for best detection, shapes: (K,2), (K,)
-    """
-
-    candidates: List[Tuple[int, np.ndarray, np.ndarray]] = []
-    for candidate_frame in (frame, frame_masked):
-        results = model.predict(candidate_frame, verbose=False, conf=0.1)
-        if not results:
-            continue
-        r = results[0]
-        if r.keypoints is None or r.keypoints.xy is None or len(r.keypoints.xy) == 0:
-            continue
-        xy_all = r.keypoints.xy.cpu().numpy()  # (N, K, 2)
-        conf_all = r.keypoints.conf
-        if conf_all is None:
-            conf_np = np.ones(xy_all.shape[:2], dtype=np.float32)
-        else:
-            conf_np = conf_all.cpu().numpy()
-        for i in range(xy_all.shape[0]):
-            vis_count = int(np.sum(conf_np[i] >= kp_conf))
-            candidates.append((vis_count, xy_all[i], conf_np[i]))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    _, xy, conf = candidates[0]
-    return xy, conf
-
-
-def estimate_homography_from_keypoints(
-    xy: np.ndarray,
-    conf: np.ndarray,
-    kp_conf: float,
-    px_per_m: float,
-    margin_px: int,
-) -> Tuple[Optional[np.ndarray], int, float]:
-    src_pts = []
-    dst_pts = []
-    used = 0
-
-    for idx, (pt_xy, c) in enumerate(zip(xy, conf)):
-        if idx not in KEYPOINT_TO_WORLD_M:
-            continue
-        if float(c) < kp_conf:
-            continue
-        used += 1
-        src_pts.append([float(pt_xy[0]), float(pt_xy[1])])
-        wx, wy = KEYPOINT_TO_WORLD_M[idx]
-        dx, dy = meter_to_canvas(wx, wy, px_per_m=px_per_m, margin_px=margin_px)
-        dst_pts.append([dx, dy])
-
-    if used < 4:
-        return None, used, 0.0
-
-    src = np.asarray(src_pts, dtype=np.float32)
-    dst = np.asarray(dst_pts, dtype=np.float32)
-    H, inlier_mask = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=5.0)
-    if H is None:
-        return None, used, 0.0
-    H = H / H[2, 2]
-    inlier_ratio = 0.0
-    if inlier_mask is not None and len(inlier_mask) > 0:
-        inlier_ratio = float(np.sum(inlier_mask)) / float(len(inlier_mask))
-    return H, used, inlier_ratio
-
-
 def draw_ar_lines(frame: np.ndarray, H_img_to_field: np.ndarray, field_line_layer: np.ndarray, alpha: float = 0.55) -> np.ndarray:
     H_field_to_img = np.linalg.inv(H_img_to_field)
     warped = cv2.warpPerspective(field_line_layer, H_field_to_img, (frame.shape[1], frame.shape[0]))
     mask = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) > 0
-
     out = frame.copy()
     out[mask] = cv2.addWeighted(out[mask], 1.0 - alpha, warped[mask], alpha, 0.0)
     return out
@@ -408,54 +380,117 @@ def add_radar_inset(frame: np.ndarray, radar_img: np.ndarray, width_px: int = 36
     return out
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Football pitch homography pipeline")
-    parser.add_argument("--video", required=True, type=Path, help="Path to input video")
-    parser.add_argument("--mot", required=True, type=Path, help="Path to MOT txt")
-    parser.add_argument("--output_dir", default=Path("outputs"), type=Path, help="Output directory")
-    parser.add_argument("--model_path", default=None, type=Path, help="Local YOLO keypoint model .pt")
-    parser.add_argument("--model_repo", default="Adit-jain/Soccana_Keypoint", type=str, help="HF model repo")
-    parser.add_argument(
-        "--model_filename",
-        default="Model/weights/best.pt",
-        type=str,
-        help="HF model filename inside repo",
-    )
-    parser.add_argument("--device", default=None, type=str, help='Device for YOLO (e.g. "cpu", "0")')
-    parser.add_argument("--kp_conf", default=0.45, type=float, help="Keypoint confidence threshold")
-    parser.add_argument("--mot_conf", default=0.0, type=float, help="MOT confidence threshold")
-    parser.add_argument("--mot_dilate", default=11, type=int, help="Player mask dilation kernel size")
-    parser.add_argument("--px_per_m", default=10.0, type=float, help="Radar scale")
-    parser.add_argument("--field_margin_px", default=40, type=int, help="Radar field margin")
-    parser.add_argument("--ema_alpha", default=0.35, type=float, help="Homography EMA smoothing")
-    parser.add_argument("--max_h_jump_px", default=170.0, type=float, help="Reject larger homography jumps")
-    parser.add_argument("--frame_stride", default=1, type=int, help="Process every Nth frame")
-    parser.add_argument("--radar_width_px", default=360, type=int, help="Inset radar width in output video")
-    return parser.parse_args()
+def landmark_help_text() -> str:
+    lines = ["Available landmark names:"]
+    for name, (x, y) in LANDMARKS_M.items():
+        lines.append(f"  - {name:28s} -> ({x:.2f}, {y:.2f})")
+    lines.append("At least 4 points per anchor frame are required (6+ recommended).")
+    return "\n".join(lines)
 
 
-def main() -> None:
-    args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+def read_frame(video_path: Path, frame_idx_1: int) -> np.ndarray:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_idx_1 - 1))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError(f"Could not read frame {frame_idx_1} from {video_path}")
+    return frame
 
+
+def collect_anchor_points_for_frame(frame_bgr: np.ndarray, frame_idx_1: int) -> List[dict]:
+    print("\n" + "=" * 80)
+    print(f"[ANNOTATE] Frame {frame_idx_1}")
+    print(landmark_help_text())
+    print('Type a landmark name and click once. Type "done" when finished, "list" to print landmarks again.')
+
+    points: List[dict] = []
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+    while True:
+        name = input("landmark name> ").strip()
+        if name.lower() == "done":
+            break
+        if name.lower() == "list":
+            print(landmark_help_text())
+            continue
+        if name not in LANDMARKS_M:
+            print("[WARN] Unknown landmark name.")
+            continue
+
+        fig, ax = plt.subplots(figsize=(12, 7))
+        ax.imshow(frame_rgb)
+        ax.set_title(f"Frame {frame_idx_1} | Click: {name}")
+        ax.axis("off")
+        clicked = plt.ginput(1, timeout=0)
+        plt.close(fig)
+
+        if not clicked:
+            print("[WARN] No click captured.")
+            continue
+        x, y = clicked[0]
+        points.append({"name": name, "image": [float(x), float(y)]})
+        print(f"[OK] {name} -> image({x:.1f}, {y:.1f}) world{LANDMARKS_M[name]}")
+
+    return points
+
+
+def run_annotation_mode(args: argparse.Namespace) -> None:
+    frame_ids = parse_frames_arg(args.frames)
+    if not frame_ids:
+        raise ValueError("No frames provided. Use --frames, e.g. 1,250,500")
+
+    anchors = []
+    for frame_idx_1 in frame_ids:
+        frame = read_frame(args.video, frame_idx_1)
+        points = collect_anchor_points_for_frame(frame, frame_idx_1)
+        if len(points) < 4:
+            print(f"[WARN] Frame {frame_idx_1} has only {len(points)} points (will be ignored at run time).")
+        anchors.append({"frame": frame_idx_1, "points": points})
+
+    payload = {
+        "video": str(args.video),
+        "anchors": anchors,
+        "landmarks_m": LANDMARKS_M,
+    }
+    args.anchors.parent.mkdir(parents=True, exist_ok=True)
+    args.anchors.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[DONE] Wrote anchors: {args.anchors}")
+
+
+def line_overlap_score(
+    H_img_to_field: np.ndarray,
+    field_line_layer: np.ndarray,
+    observed_line_mask: np.ndarray,
+) -> float:
+    H_field_to_img = np.linalg.inv(H_img_to_field)
+    warped = cv2.warpPerspective(field_line_layer, H_field_to_img, (observed_line_mask.shape[1], observed_line_mask.shape[0]))
+    pred = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) > 0
+    obs = observed_line_mask > 0
+    pred_count = int(np.sum(pred))
+    if pred_count == 0:
+        return 0.0
+    overlap = int(np.sum(pred & obs))
+    return float(overlap) / float(pred_count)
+
+
+def run_pipeline_mode(args: argparse.Namespace) -> None:
     if not args.video.exists():
         raise FileNotFoundError(f"Video not found: {args.video}")
     if not args.mot.exists():
         raise FileNotFoundError(f"MOT file not found: {args.mot}")
+    if not args.anchors.exists():
+        raise FileNotFoundError(f"Anchors file not found: {args.anchors}")
 
-    model_path = args.model_path
-    if model_path is None:
-        model_path = download_default_model(args.model_repo, args.model_filename)
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    print(f"[INFO] Loading keypoint model: {model_path}")
-    model = YOLO(str(model_path))
-    if args.device:
-        model.to(args.device)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] Reading MOT file: {args.mot}")
     mot_by_frame = parse_mot(args.mot, min_conf=args.mot_conf)
+    anchor_H = load_anchor_homographies(args.anchors, px_per_m=args.px_per_m, margin_px=args.field_margin_px)
+    if not anchor_H:
+        raise RuntimeError("No valid anchors found (need 4+ valid points per anchor frame).")
 
     cap = cv2.VideoCapture(str(args.video))
     if not cap.isOpened():
@@ -466,7 +501,7 @@ def main() -> None:
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    out_video = args.output_dir / f"{args.video.stem}_ar_radar.mp4"
+    out_video = args.output_dir / f"{args.video.stem}_ar_radar_hitl.mp4"
     writer = cv2.VideoWriter(
         str(out_video),
         cv2.VideoWriter_fourcc(*"mp4v"),
@@ -481,6 +516,7 @@ def main() -> None:
     player_csv = args.output_dir / "player_positions.csv"
 
     H_prev: Optional[np.ndarray] = None
+    prev_gray: Optional[np.ndarray] = None
     player_rows: List[List[object]] = []
 
     with homography_jsonl.open("w", encoding="utf-8") as hlog:
@@ -488,55 +524,63 @@ def main() -> None:
             ok, frame = cap.read()
             if not ok:
                 break
-            frame_idx_1 = idx + 1  # MOT is typically 1-indexed
-
-            if args.frame_stride > 1 and (idx % args.frame_stride != 0):
-                if H_prev is not None:
-                    drawn = draw_ar_lines(frame, H_prev, field_line_layer)
-                    writer.write(add_radar_inset(drawn, radar_bg, width_px=args.radar_width_px))
-                else:
-                    writer.write(frame)
-                continue
+            frame_idx_1 = idx + 1
 
             players = mot_by_frame.get(frame_idx_1, [])
-            mask = build_player_mask((frame_h, frame_w), players, dilation_px=args.mot_dilate)
-            frame_masked = apply_player_suppression(frame, mask)
+            player_mask = build_player_mask((frame_h, frame_w), players, dilation_px=args.mot_dilate)
+            static_mask = cv2.bitwise_not(player_mask)
 
-            detection = extract_best_keypoints(model, frame, frame_masked, kp_conf=args.kp_conf)
+            suppressed = apply_player_suppression(frame, player_mask)
+            curr_gray = cv2.cvtColor(suppressed, cv2.COLOR_BGR2GRAY)
+
             H_curr = None
-            used_kpts = 0
-            inlier_ratio = 0.0
-            if detection is not None:
-                xy, conf = detection
-                H_curr, used_kpts, inlier_ratio = estimate_homography_from_keypoints(
-                    xy=xy,
-                    conf=conf,
-                    kp_conf=args.kp_conf,
-                    px_per_m=args.px_per_m,
-                    margin_px=args.field_margin_px,
-                )
+            status = "missing"
+            ecc_cc = -1.0
+            drift_score = 0.0
 
-            if H_curr is not None and H_prev is not None:
-                jump = homography_jump_px(H_prev, H_curr, image_w=frame_w, image_h=frame_h)
-                if jump > args.max_h_jump_px:
-                    H_curr = None
+            if frame_idx_1 in anchor_H:
+                H_curr = anchor_H[frame_idx_1]
+                status = "anchor"
+            elif H_prev is not None and prev_gray is not None:
+                W_prev_to_curr, ecc_cc = estimate_prev_to_curr_warp(
+                    prev_gray=prev_gray,
+                    curr_gray=curr_gray,
+                    static_mask_curr=static_mask,
+                    ecc_iters=args.ecc_iters,
+                )
+                if W_prev_to_curr is not None:
+                    try:
+                        W_inv = np.linalg.inv(W_prev_to_curr)
+                        H_prop = H_prev @ W_inv
+                        H_curr = smooth_homography(H_prev, H_prop / H_prop[2, 2], alpha=args.ema_alpha)
+                        status = "propagated"
+                    except np.linalg.LinAlgError:
+                        H_curr = H_prev
+                        status = "carry"
+                else:
+                    H_curr = H_prev
+                    status = "carry"
 
             if H_curr is not None:
-                H_est = smooth_homography(H_prev, H_curr, alpha=args.ema_alpha)
-                H_prev = H_est
+                line_mask = compute_line_mask(frame, static_mask=static_mask)
+                drift_score = line_overlap_score(H_curr, field_line_layer, line_mask)
+                if drift_score < args.min_line_overlap and status != "anchor":
+                    # Soft fail: keep previous H but mark low-confidence to request more anchors.
+                    if H_prev is not None:
+                        H_curr = H_prev
+                    status = "low_conf"
+
+            if H_curr is not None:
+                H_prev = H_curr
 
             radar_frame = radar_bg.copy()
             annotated = frame.copy()
 
-            homography_status = "missing"
             if H_prev is not None:
-                homography_status = "ok"
                 annotated = draw_ar_lines(annotated, H_prev, field_line_layer)
-
                 if players:
                     feet = np.array([p.foot for p in players], dtype=np.float32)
                     feet_on_field = project_points(H_prev, feet)
-
                     for p, topdown in zip(players, feet_on_field):
                         tx, ty = float(topdown[0]), float(topdown[1])
                         in_bounds = 0.0 <= tx < radar_w and 0.0 <= ty < radar_h
@@ -572,7 +616,7 @@ def main() -> None:
             annotated = add_radar_inset(annotated, radar_frame, width_px=args.radar_width_px)
             cv2.putText(
                 annotated,
-                f"Frame: {frame_idx_1} | H: {homography_status} | keypoints: {used_kpts} | inliers: {inlier_ratio:.2f}",
+                f"Frame:{frame_idx_1} | H:{status} | ECC:{ecc_cc:.3f} | line:{drift_score:.2f}",
                 (18, frame_h - 16),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.62,
@@ -584,9 +628,10 @@ def main() -> None:
 
             payload = {
                 "frame": frame_idx_1,
-                "status": homography_status,
-                "used_keypoints": used_kpts,
-                "inlier_ratio": inlier_ratio,
+                "status": status,
+                "ecc_cc": ecc_cc,
+                "line_overlap": drift_score,
+                "is_anchor_frame": frame_idx_1 in anchor_H,
                 "H_img_to_field": H_prev.tolist() if H_prev is not None else None,
             }
             hlog.write(json.dumps(payload) + "\n")
@@ -614,6 +659,44 @@ def main() -> None:
     print("[DONE] Output video:", out_video)
     print("[DONE] Homography log:", homography_jsonl)
     print("[DONE] Player positions:", player_csv)
+    print("[INFO] If many frames show status=low_conf, add more anchor frames and rerun.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Human-in-the-loop football homography pipeline")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_annotate = sub.add_parser("annotate", help="Interactive anchor annotation")
+    p_annotate.add_argument("--video", required=True, type=Path, help="Path to input video")
+    p_annotate.add_argument("--frames", required=True, type=str, help="Comma-separated frame indices (1-based)")
+    p_annotate.add_argument("--anchors", required=True, type=Path, help="Output anchors JSON path")
+
+    p_run = sub.add_parser("run", help="Run pipeline with MOT + anchors")
+    p_run.add_argument("--video", required=True, type=Path, help="Path to input video")
+    p_run.add_argument("--mot", required=True, type=Path, help="Path to MOT txt")
+    p_run.add_argument("--anchors", required=True, type=Path, help="Path to anchors JSON")
+    p_run.add_argument("--output_dir", default=Path("outputs"), type=Path, help="Output directory")
+    p_run.add_argument("--mot_conf", default=0.0, type=float, help="MOT confidence threshold")
+    p_run.add_argument("--mot_dilate", default=11, type=int, help="Player mask dilation kernel size")
+    p_run.add_argument("--px_per_m", default=10.0, type=float, help="Radar scale")
+    p_run.add_argument("--field_margin_px", default=40, type=int, help="Radar field margin")
+    p_run.add_argument("--ema_alpha", default=0.35, type=float, help="EMA smoothing of propagated H")
+    p_run.add_argument("--ecc_iters", default=60, type=int, help="Max ECC iterations")
+    p_run.add_argument("--min_line_overlap", default=0.08, type=float, help="Low-confidence threshold")
+    p_run.add_argument("--radar_width_px", default=360, type=int, help="Inset radar width in output video")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.command == "annotate":
+        run_annotation_mode(args)
+        return
+    if args.command == "run":
+        run_pipeline_mode(args)
+        return
+    raise RuntimeError(f"Unknown command: {args.command}")
 
 
 if __name__ == "__main__":

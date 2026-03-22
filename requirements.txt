@@ -2,5 +2,4 @@ numpy
 opencv-python
 pandas
 tqdm
-ultralytics
-huggingface_hub
+matplotlib
